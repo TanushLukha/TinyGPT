@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinygpt"
+version = "0.1.0"
+description = "A small GPT for Hindi and Hinglish, built from scratch in PyTorch"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Tanush Lukha" }]
+dependencies = ["regex>=2023.0", "numpy>=1.24", "tqdm>=4.60"]
+
+[project.optional-dependencies]
+data = ["datasets>=2.16", "pyarrow>=14"]
+compare = ["sentencepiece>=0.1.99", "tiktoken>=0.5"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
