@@ -1,9 +1,10 @@
 """Collect every baseline into one table and plot the learning curves.
 
     python scripts/report.py              # all runs in checkpoints/ + docs/results/m2_ngram.json
+    python scripts/report.py --name m3 --runs lstm gpt-small gpt gpt-llama
     python scripts/report.py --runs lstm
 
-Writes docs/results/m2_baselines.md and docs/results/m2_curves.png.
+Writes docs/results/<name>_baselines.md and docs/results/<name>_curves.png (name: m2 by default).
 """
 from __future__ import annotations
 
@@ -12,9 +13,8 @@ import json
 import math
 from pathlib import Path
 
-# chart styling: light surface, recessive grid, 2px lines, categorical hues in a fixed order
-SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]
+from tinygpt.plotting import INK, INK2, MUTED, SURFACE, run_colors, spread_labels, style_axes
+
 REFERENCES = ("bigram", "4-gram")                # n-gram rows drawn as reference lines
 
 
@@ -53,32 +53,33 @@ def plot(curves: dict[str, list[dict]], ngrams: list[dict], path: Path) -> None:
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2), facecolor=SURFACE)
     for ax in (ax1, ax2):
-        ax.set_facecolor(SURFACE)
-        ax.grid(True, color=GRID, linewidth=1)
-        ax.set_axisbelow(True)
-        for side in ("top", "right"):
-            ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"):
-            ax.spines[side].set_color(AXIS)
-        ax.tick_params(colors=MUTED, labelcolor=INK2)
+        style_axes(ax)
         ax.set_xlabel("training tokens seen (millions)", color=INK2)
 
     refs = {r["model"]: r["val"]["all"]["bpb"] for r in ngrams if "JM" in r["smoothing"]}
+    firsts = [v[0]["bpb"] for v in ([r for r in rows if r["kind"] == "val" and r["iter"] > 0]
+                                    for rows in curves.values()) if v]
+    lasts = [[r for r in rows if r["kind"] == "val"][-1]["bpb"] for rows in curves.values()]
     for name in REFERENCES:
         if name in refs:
-            ax1.axhline(refs[name], color=MUTED, linewidth=1)
-            ax1.annotate(f"{name} {refs[name]:.3f}", (0, refs[name]), xycoords=("axes fraction", "data"),
-                         xytext=(4, 4), textcoords="offset points", ha="left", va="bottom", color=INK2,
-                         fontsize=9)
-    for color, (run, rows) in zip(SERIES, curves.items()):
+            y = refs[name]
+            ax1.axhline(y, color=MUTED, linewidth=1)
+            # put the label at whichever end of the line the curves pass farther away from
+            left = min((abs(v - y) for v in firsts), default=1.0) >= min((abs(v - y) for v in lasts), default=1.0)
+            ax1.annotate(f"{name} {y:.3f}", (0.0 if left else 0.86, y), xycoords=("axes fraction", "data"),
+                         xytext=(4, 4), textcoords="offset points", ha="left" if left else "right",
+                         va="bottom", color=INK2, fontsize=9)
+    colors = run_colors(list(curves))
+    ends = {}
+    for run, rows in curves.items():
+        color = colors[run]
         val = [r for r in rows if r["kind"] == "val" and r["iter"] > 0]
         tr = [r for r in rows if r["kind"] == "train"]
         x = [r["tokens"] / 1e6 for r in val]
         ax1.plot(x, [r["bpb"] for r in val], color=color, linewidth=2, label=run, solid_capstyle="round")
         ax1.plot(x[-1:], [val[-1]["bpb"]], "o", color=color, markersize=8, markeredgecolor=SURFACE,
                  markeredgewidth=2)
-        ax1.annotate(f"{val[-1]['bpb']:.3f}", (x[-1], val[-1]["bpb"]), xytext=(0, -14),
-                     textcoords="offset points", ha="center", color=INK, fontsize=9)
+        ends[run] = (x[-1], val[-1]["bpb"])
         ax2.plot([r["tokens"] / 1e6 for r in tr], [r["loss"] for r in tr], color=color, linewidth=1,
                  alpha=0.45, label=f"{run} train")
         ax2.plot(x, [r["loss"] for r in val], color=color, linewidth=2, label=f"{run} validation")
@@ -90,6 +91,13 @@ def plot(curves: dict[str, list[dict]], ngrams: list[dict], path: Path) -> None:
         lo = min([refs.get(n, math.inf) for n in REFERENCES] + lows)
         hi = max([refs.get("bigram", 0) * 1.12] + [f * 1.06 for f in finals])
         ax1.set_ylim(lo * 0.95, hi)
+    if ends:                                      # end values to the right of the dots, never overlapping
+        y0, y1 = ax1.get_ylim()
+        labels_y = spread_labels([y for _, y in ends.values()], gap=0.045 * (y1 - y0))
+        for (x_end, y), ly in zip(ends.values(), labels_y):
+            ax1.annotate(f"{y:.3f}", (x_end, ly), xytext=(9, 0), textcoords="offset points", ha="left",
+                         va="center", color=INK, fontsize=9)
+        ax1.set_xlim(right=max(x for x, _ in ends.values()) * 1.1)
     ax2.set_title("Train vs validation loss (nats / token)", color=INK, loc="left", fontsize=11)
     ax2.set_ylabel("cross-entropy (nats)", color=INK2)
     for ax in ([ax1] if len(curves) > 1 else []) + [ax2]:   # one series needs no legend box
@@ -104,6 +112,7 @@ def main() -> None:
     ap.add_argument("--checkpoints", default="checkpoints")
     ap.add_argument("--runs", nargs="*", help="run names (default: every run with a results.json)")
     ap.add_argument("--out", default="docs/results")
+    ap.add_argument("--name", default="m2", help="prefix of the output files")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -114,16 +123,16 @@ def main() -> None:
     runs = [json.loads((ck / n / "results.json").read_text()) for n in names]
     curves = {n: read_jsonl(ck / n / "metrics.jsonl") for n in names}
 
-    md = ["# M2 — all baselines", "",
+    md = [f"# {args.name.upper()} — results", "",
           "Validation set: every token of `data/tokens/val.bin` (99.9k tokens). Bits per byte = total "
           "cross-entropy in bits ÷ UTF-8 bytes of the text, so it doesn't depend on the tokenizer. "
           "Lower is better.", "", table(ngrams, runs), "",
-          "![learning curves](m2_curves.png)", ""]
-    (out / "m2_baselines.md").write_text("\n".join(md))
+          f"![learning curves]({args.name}_curves.png)", ""]
+    (out / f"{args.name}_baselines.md").write_text("\n".join(md))
     if curves:
-        plot(curves, ngrams, out / "m2_curves.png")
+        plot(curves, ngrams, out / f"{args.name}_curves.png")
     print("\n".join(md[4:5]))
-    print(f"-> {out / 'm2_baselines.md'}" + (f", {out / 'm2_curves.png'}" if curves else ""))
+    print(f"-> {out / (args.name + '_baselines.md')}" + (f", {out / (args.name + '_curves.png')}" if curves else ""))
 
 
 if __name__ == "__main__":

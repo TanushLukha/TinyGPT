@@ -99,6 +99,8 @@ def train(model: torch.nn.Module, model_type: str, cfg: TrainConfig, resume: boo
     train_data, val_data = TokenData(cfg.data_dir, "train"), TokenData(cfg.data_dir, "val")
     if train_data.vocab_size != model.cfg.vocab_size:
         raise ValueError(f"data has vocab {train_data.vocab_size}, model {model.cfg.vocab_size}")
+    if getattr(model.cfg, "block_size", cfg.block_size) < cfg.block_size:
+        raise ValueError(f"model handles {model.cfg.block_size} tokens, training windows are {cfg.block_size}")
 
     model.to(device)
     opt = make_optimizer(model, cfg)

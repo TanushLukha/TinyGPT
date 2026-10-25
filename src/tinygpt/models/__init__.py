@@ -3,11 +3,19 @@ from __future__ import annotations
 
 import torch
 
+from .gpt import GPT, GPTConfig
 from .lstm import LSTMConfig, LSTMLM, ScratchLSTM
 from .ngram import NGramLM, Smoothing
 
-# model_type -> (config class, model class). M3 adds "gpt".
-REGISTRY = {"lstm": (LSTMConfig, LSTMLM)}
+# model_type -> (config class, model class)
+REGISTRY = {"lstm": (LSTMConfig, LSTMLM), "gpt": (GPTConfig, GPT)}
+
+# Training settings that differ by architecture (everything else: TrainConfig's defaults).
+# Each was chosen by experiment — see docs/M2_baselines.md and docs/M3_gpt.md.
+TRAIN_DEFAULTS = {
+    "lstm": {"run": "lstm", "lr": 1e-2, "min_lr": 1e-3, "weight_decay": 0.01},
+    "gpt": {"run": "gpt", "lr": 1e-3, "min_lr": 1e-4, "weight_decay": 0.1},
+}
 
 
 def build_model(model_type: str, **config):
@@ -27,5 +35,5 @@ def load_checkpoint(path, device="cpu"):
     return model.to(device).eval(), ckpt
 
 
-__all__ = ["LSTMConfig", "LSTMLM", "ScratchLSTM", "NGramLM", "Smoothing", "REGISTRY", "build_model",
-           "load_checkpoint"]
+__all__ = ["GPT", "GPTConfig", "LSTMConfig", "LSTMLM", "ScratchLSTM", "NGramLM", "Smoothing", "REGISTRY",
+           "TRAIN_DEFAULTS", "build_model", "load_checkpoint"]

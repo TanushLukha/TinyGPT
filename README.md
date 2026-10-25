@@ -15,7 +15,7 @@ TinyGPT's tokenizer fixes that (see [M1](docs/M1_tokenizer.md)).
 |---|---|---|
 | ✅ | **M1 — Data & tokenizer** | Hindi Wikipedia + Hinglish corpus; byte-level BPE from scratch with a Devanagari-aware regex; comparison with SentencePiece and GPT tokenizers |
 | ✅ | **M2 — Baselines** | n-gram models (counting) and an LSTM (hand-written + fused); bits-per-byte evaluation; training loop with exact resume |
-| ⬜ | M3 — GPT from scratch | causal self-attention, pre-LN blocks, AdamW + cosine schedule; trained on an M2 MacBook (MPS) |
+| ✅ | **M3 — GPT from scratch** | GPT-2 and Llama recipes (attention by hand + fused kernel, learned positions vs RoPE); trained on the MacBook's GPU against M2's baselines |
 | ⬜ | M4 — Inference | temperature / top-k / top-p sampling, KV-cache with an equivalence test and a speed benchmark |
 | ⬜ | M5 — Fine-tuning | LoRA from scratch on a Hinglish task |
 | ⬜ | M6 — Ship | FastAPI service, Docker image, Gradio demo on Hugging Face Spaces |
@@ -63,6 +63,18 @@ python scripts/compare_models.py               # 10. per-source scores + LSTM/n-
 | 7. LSTM | `checkpoints/lstm/`: `best.pt`, `last.pt`, `metrics.jsonl`, `results.json` |
 | 9. report | `docs/results/m2_baselines.md`, `docs/results/m2_curves.png` |
 | 10. comparison | `docs/results/compare.md` |
+
+**M3 — the GPT:**
+
+```bash
+python scripts/bench.py --model gpt            # 11. how long will a GPT run take on this machine?
+caffeinate -i bash scripts/run_m3.sh           # 12. three GPTs, then tables, curves, attention maps, samples
+```
+
+`run_m3.sh` trains `gpt` (GPT-2 recipe, 13.9M parameters), `gpt-small` (5.3M, the LSTM's size) and
+`gpt-llama` (RoPE, RMSNorm, SwiGLU), then writes `docs/results/m3_baselines.md`, `m3_curves.png`,
+`m3_compare.md`, `m3_context.png`, `attention.png` and `attention_llama.png`. Re-running it skips
+finished runs and resumes an interrupted one.
 
 An interrupted run continues exactly where it stopped with `python scripts/train.py --resume`.
 Every training setting is a flag (`python scripts/train.py --help`).
@@ -118,6 +130,27 @@ depend on the tokenizer (lower is better; details in [M2](docs/M2_baselines.md))
   generalisation.
 - Mixing the two gives 0.766: they know different things. That is the bar for M3's GPT.
 
+## Results (M3, GPT from scratch)
+
+Same data, same 32.8M training tokens, same evaluation as M2 (details in [M3](docs/M3_gpt.md)):
+
+| Model | Size | Bits/byte | Hindi | Hinglish | Time on the M2 GPU |
+|---|---|---:|---:|---:|---:|
+| 4-gram (M2) | 20.6M counts | 0.848 | 0.829 | **1.029** | — |
+| LSTM (M2) | 5.5M | 0.831 | 0.785 | 1.265 | 16 min |
+| GPT-2 recipe, 4 × 256 | 5.3M | 0.823 | 0.770 | 1.319 | 18 min |
+| GPT-2 recipe, 6 × 384 | 13.9M | 0.784 | 0.735 | 1.241 | 50 min |
+| **Llama recipe, 6 × 384** (RoPE, RMSNorm, SwiGLU) | 13.8M | **0.733** | **0.689** | 1.147 | 53 min |
+
+![M3 learning curves](docs/results/m3_curves.png)
+
+- At the LSTM's size, attention wins by only 1%; scale (2.6× parameters) gives 4.7%; the 2023
+  recipe another **6.5% at the same size** — 12% better than the LSTM, 14% better than the 4-gram.
+- Only the RoPE model keeps using context beyond ~64 tokens, and only it has started to copy a
+  repeated random sequence: its heads form the classic previous-token → induction circuit (72% of
+  one head's attention goes to the previous token; another head puts 23% on the copy target).
+- The 4-gram still wins on templated Hinglish; mixing it with the best GPT gives 0.701.
+
 ## Project layout
 
 ```
@@ -132,8 +165,10 @@ src/tinygpt/
   models/
     ngram.py    n-gram counts as sorted int64 codes; add-k and Jelinek-Mercer smoothing
     lstm.py     LSTM language model; ScratchLSTM = the same LSTM written gate by gate
+    gpt.py      GPT: GPT-2 / Llama recipes, attention by hand or fused, RoPE, RMSNorm, SwiGLU
 scripts/        get_data · train_tokenizer · compare_tokenizers · encode_dataset ·
-                ngram_baselines · bench · train · sample · report · compare_models
+                ngram_baselines · bench · train · sample · report · compare_models · attention ·
+                run_m3.sh
 tests/          round trips on random Unicode, fast BPE == naive BPE, hand-written LSTM ==
                 nn.LSTM, n-gram scores == full distributions, stop-and-resume == uninterrupted, ...
 docs/           one guide per milestone (concepts, decisions, interview questions)
