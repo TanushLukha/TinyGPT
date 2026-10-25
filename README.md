@@ -14,18 +14,18 @@ TinyGPT's tokenizer fixes that (see [M1](docs/M1_tokenizer.md)).
 | | Milestone | What gets built |
 |---|---|---|
 | ✅ | **M1 — Data & tokenizer** | Hindi Wikipedia + Hinglish corpus; byte-level BPE from scratch with a Devanagari-aware regex; comparison with SentencePiece and GPT tokenizers |
-| ⬜ | M2 — Baselines | bigram and LSTM language models; bits-per-byte evaluation |
+| ✅ | **M2 — Baselines** | n-gram models (counting) and an LSTM (hand-written + fused); bits-per-byte evaluation; training loop with exact resume |
 | ⬜ | M3 — GPT from scratch | causal self-attention, pre-LN blocks, AdamW + cosine schedule; trained on an M2 MacBook (MPS) |
 | ⬜ | M4 — Inference | temperature / top-k / top-p sampling, KV-cache with an equivalence test and a speed benchmark |
 | ⬜ | M5 — Fine-tuning | LoRA from scratch on a Hinglish task |
 | ⬜ | M6 — Ship | FastAPI service, Docker image, Gradio demo on Hugging Face Spaces |
 
-## Quick start (M1)
+## Quick start
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate     # Python 3.9+
 pip install -e ".[data,compare,dev]"
-pytest -q                                               # 39 unit tests, a few seconds
+pytest -q tests/test_bpe.py tests/test_text.py         # M1's tests, a few seconds
 
 python scripts/get_data.py               # 1. corpus: Hindi Wikipedia + Hinglish (~150 MB download)
 python scripts/train_tokenizer.py        # 2. BPE tokenizer, 8,192 tokens
@@ -42,6 +42,30 @@ python scripts/encode_dataset.py         # 4. token files for training
 
 To check the pipeline quickly without the big download, run step 1 as
 `python scripts/get_data.py --source dev` (a 5 MB corpus from GitHub); the other steps are the same.
+
+**M2 — baselines** (needs PyTorch):
+
+```bash
+pip install -e ".[train]"                      # PyTorch + matplotlib
+pytest -q                                      # all tests; two run only on a GPU (Apple MPS / CUDA)
+
+python scripts/ngram_baselines.py              # 5. n-gram baselines, about a minute
+python scripts/bench.py                        # 6. how fast does training run on this machine?
+caffeinate -i python scripts/train.py          # 7. LSTM baseline (caffeinate keeps a Mac awake)
+python scripts/sample.py                       # 8. generate text from the trained LSTM
+python scripts/report.py                       # 9. one table with every baseline + learning curves
+python scripts/compare_models.py               # 10. per-source scores + LSTM/n-gram mixture
+```
+
+| Step | Output |
+|---|---|
+| 5. n-grams | `docs/results/m2_ngram.md` (+ `.json`) |
+| 7. LSTM | `checkpoints/lstm/`: `best.pt`, `last.pt`, `metrics.jsonl`, `results.json` |
+| 9. report | `docs/results/m2_baselines.md`, `docs/results/m2_curves.png` |
+| 10. comparison | `docs/results/compare.md` |
+
+An interrupted run continues exactly where it stopped with `python scripts/train.py --resume`.
+Every training setting is a flag (`python scripts/train.py --help`).
 
 ## Results (M1, full corpus)
 
@@ -70,16 +94,49 @@ Corpus: 134.7 MB of text → **18.2M training tokens** (Hindi Wikipedia 14.0M, H
 
 Full table with bytes/token: [docs/results/tokenizers.md](docs/results/tokenizers.md).
 
+## Results (M2, baselines)
+
+Validation bits per byte — total cross-entropy divided by the size of the text, so it doesn't
+depend on the tokenizer (lower is better; details in [M2](docs/M2_baselines.md)):
+
+| Model | Size | Bits/byte | Hindi | Hinglish |
+|---|---|---:|---:|---:|
+| uniform (1/8,192 per token) | — | 1.781 | 1.572 | 3.738 |
+| unigram | 8k counts | 1.482 | 1.303 | 3.166 |
+| bigram | 1.7M counts | 0.983 | 0.915 | 1.617 |
+| trigram | 8.9M counts | 0.877 | 0.838 | 1.239 |
+| 4-gram | 20.6M counts | 0.848 | 0.829 | **1.029** |
+| **LSTM**, 2 × 384 (16 min on the M2's GPU) | 5.5M parameters | **0.831** | **0.785** | 1.265 |
+| LSTM + 4-gram mixture | both | 0.766 | 0.740 | 1.016 |
+
+![M2 learning curves](docs/results/m2_curves.png)
+
+- The LSTM beats every n-gram overall and on Hindi with a quarter of the stored numbers, and was
+  still improving when its 32.8M-token budget ran out.
+- The 4-gram wins on Hinglish: its validation sentences mostly repeat training phrases (only 2.4%
+  of Hinglish-TOP's 4-grams are new), which exact counts replay perfectly — memorisation vs
+  generalisation.
+- Mixing the two gives 0.766: they know different things. That is the bar for M3's GPT.
+
 ## Project layout
 
 ```
 src/tinygpt/
-  bpe.py      byte-level BPE: training (incremental pair counts + heap), encode, decode, save/load
-  text.py     NFC normalisation, whitespace clean-up, script detection, train/val split
-  data.py     corpus sources: Hindi Wikipedia, Hinglish datasets, small dev corpus
-scripts/      get_data · train_tokenizer · compare_tokenizers · encode_dataset
-tests/        39 tests: round trips on random Unicode, fast trainer == naive trainer, ...
-docs/         one guide per milestone (concepts, decisions, interview questions)
+  bpe.py        byte-level BPE: training (incremental pair counts + heap), encode, decode, save/load
+  text.py       NFC normalisation, whitespace clean-up, script detection, train/val split
+  data.py       corpus sources: Hindi Wikipedia, Hinglish datasets, small dev corpus
+  dataset.py    memory-mapped token files: random training windows, exact evaluation windows
+  metrics.py    bits per byte, overall and per language
+  trainer.py    training loop: AdamW, warm-up + cosine, clipping, checkpoints, exact resume
+  sampling.py   temperature and top-k sampling
+  models/
+    ngram.py    n-gram counts as sorted int64 codes; add-k and Jelinek-Mercer smoothing
+    lstm.py     LSTM language model; ScratchLSTM = the same LSTM written gate by gate
+scripts/        get_data · train_tokenizer · compare_tokenizers · encode_dataset ·
+                ngram_baselines · bench · train · sample · report · compare_models
+tests/          round trips on random Unicode, fast BPE == naive BPE, hand-written LSTM ==
+                nn.LSTM, n-gram scores == full distributions, stop-and-resume == uninterrupted, ...
+docs/           one guide per milestone (concepts, decisions, interview questions)
 ```
 
 ## Data and licences
