@@ -17,7 +17,7 @@ TinyGPT's tokenizer fixes that (see [M1](docs/M1_tokenizer.md)).
 | ✅ | **M2 — Baselines** | n-gram models (counting) and an LSTM (hand-written + fused); bits-per-byte evaluation; training loop with exact resume |
 | ✅ | **M3 — GPT from scratch** | GPT-2 and Llama recipes (attention by hand + fused kernel, learned positions vs RoPE); trained on the MacBook's GPU against M2's baselines |
 | ✅ | **M4 — Inference** | greedy, temperature, top-k, top-p, min-p and repetition penalty measured against real text; KV-cache with equivalence tests and a speed benchmark; streaming; RoPE-only ablation |
-| ⬜ | M5 — Fine-tuning | LoRA from scratch on a Hinglish task |
+| ✅ | **M5 — Fine-tuning** | LoRA written from scratch vs full fine-tuning vs training from scratch vs few-shot prompting, on Hinglish-TOP semantic parsing; a decontaminated base model |
 | ⬜ | M6 — Ship | FastAPI service, Docker image, Gradio demo on Hugging Face Spaces |
 
 ## Quick start
@@ -87,6 +87,19 @@ python scripts/sample.py --stream --top-p 0.9 --top-k 0      # text appears as i
 with and without the KV-cache), `m4_decoding.md` (8 decoding strategies vs real text), trains `gpt-rope`
 (GPT-2 recipe with RoPE only), then `m4_rope_baselines.md`, `m4_rope_curves.png`,
 `m4_rope_compare.md`, `m4_rope_context.png` and `heads.md` + `heads.png` (attention-head census).
+
+**M5 — fine-tuning:**
+
+```bash
+caffeinate -i bash scripts/run_m5.sh           # 14. clean base model, ~30 fine-tuning runs, report (~3 h)
+python scripts/parse.py --out-dir runs/m5-annotated --run full-long "kal subah 7 baje ka alarm laga do"
+```
+
+`run_m5.sh` downloads Hinglish-TOP (`data/top/`), removes its validation and test requests from the
+pretraining text (`data/clean_dc/`, `data/tokens_dc/`), pretrains `gpt-llama-clean`, runs the
+fine-tuning experiments (`runs/m5/`, `runs/m5-annotated/`) and writes `docs/results/m5_finetune.md`,
+`m5_rank.png` and `m5_data.png`. It prints the output format and learning rates it chose and the
+name of the best LoRA run.
 
 An interrupted run continues exactly where it stopped with `python scripts/train.py --resume`.
 Every training setting is a flag (`python scripts/train.py --help`).
@@ -210,6 +223,33 @@ the model, repeat-4 = share of 4-token sequences that repeat earlier ones):
   for the GPU's answer, a fixed price that dominates. With 16 sequences the GPU catches up (3,415 vs
   3,314 on the CPU).
 
+## Results (M5, fine-tuning)
+
+Hinglish-TOP: turn an assistant request into its intent and slots, e.g. `kal subah 7 baje ka alarm
+laga do` → `[IN:CREATE_ALARM [SL:DATE_TIME kal subah 7 baje ] ]`. 2,993 training examples; exact match
+of the whole parse on 6,513 test requests (details in [M5](docs/M5_lora.md)):
+
+| Method | Trainable weights | To store per task | Test exact match | Slot F1 |
+|---|---:|---:|---:|---:|
+| lookup table (identical training request) | 0 | — | 9.3% | 11.0% |
+| few-shot: 3 solved examples in the prompt | 0 | — | 0.0% | 0.0% |
+| same network, from scratch | 13.8M | 55 MB | 19.1% | 28.1% |
+| **full fine-tuning** | 13.8M | 55 MB | **38.0%** | **53.4%** |
+| LoRA r=8 (written from scratch) | 313K (2.3%) | 1.3 MB | 19.5% | 29.9% |
+| *3× longer training:* full fine-tuning / LoRA | | | 41.0% / 32.4% | 56.8% / 46.7% |
+
+![exact match vs trainable weights](docs/results/m5_rank.png)
+
+- At 14M parameters, full fine-tuning wins; LoRA mostly learns slower — 3× the steps take it from
+  19.5% to 32.4% (full fine-tuning: 38.0% → 41.0%). Rank matters (r=1: 3.1%, r=64: 25.9%), and so do
+  the MLP adapters (attention-only: 5.1%).
+- Pretraining doubles the parser (38.0% vs 19.1% from scratch); the 14M model can't learn from
+  examples in its prompt at all.
+- 99.5% of the test requests were in M1's pretraining text. A base model retrained without them
+  parses exactly as well (LoRA 19.5% vs 19.2%, full 38.0% vs 37.5%), although the old one had
+  partly memorised them (0.235 nats/token lower loss on them).
+- Failure mode: names the training data never had are replaced by ones it had (`Delhi` → `Duran`).
+
 ## Project layout
 
 ```
@@ -222,16 +262,20 @@ src/tinygpt/
   plotting.py   one look for every chart, a fixed colour per model
   trainer.py    training loop: AdamW, warm-up + cosine, clipping, checkpoints, exact resume
   sampling.py   greedy, temperature, top-k, top-p, min-p, repetition penalty; streaming text
+  lora.py       LoRA: a low-rank update for any linear layer; merge, save and load adapters
+  top.py        Hinglish-TOP: parse trees, the decoupled form, scores, prompts, batched greedy parsing
   models/
     ngram.py    n-gram counts as sorted int64 codes; add-k and Jelinek-Mercer smoothing
     lstm.py     LSTM language model; ScratchLSTM = the same LSTM written gate by gate
     gpt.py      GPT: GPT-2 / Llama recipes, attention by hand or fused, RoPE, RMSNorm, SwiGLU, KV-cache
 scripts/        get_data · train_tokenizer · compare_tokenizers · encode_dataset ·
                 ngram_baselines · bench · train · sample · report · compare_models · attention ·
-                heads · decoding · bench_generate · run_m3.sh · run_m4.sh
+                heads · decoding · bench_generate · decontaminate · finetune · m5_best · report_m5 ·
+                parse · run_m3.sh · run_m4.sh · run_m5.sh
 tests/          round trips on random Unicode, fast BPE == naive BPE, hand-written LSTM ==
                 nn.LSTM, n-gram scores == full distributions, stop-and-resume == uninterrupted,
-                KV-cache == full forward pass, streamed text == decoded text, ...
+                KV-cache == full forward pass, streamed text == decoded text, LoRA starts as the
+                base model and merges exactly, fine-tuning runs end to end, ...
 docs/           one guide per milestone (concepts, decisions, interview questions)
 ```
 
@@ -241,7 +285,7 @@ docs/           one guide per milestone (concepts, decisions, interview question
 |---|---|---|
 | [Hindi Wikipedia](https://huggingface.co/datasets/wikimedia/wikipedia) (20231101.hi) | Hindi text | CC BY-SA 4.0 |
 | [findnitai/english-to-hinglish](https://huggingface.co/datasets/findnitai/english-to-hinglish) | Hinglish sentences | Apache-2.0 |
-| [Hinglish-TOP](https://github.com/google-research-datasets/Hinglish-TOP-Dataset) | Hinglish queries | Apache-2.0 |
+| [Hinglish-TOP](https://github.com/google-research-datasets/Hinglish-TOP-Dataset) | Hinglish queries; M5's parsing task | Apache-2.0 |
 | [UD Hindi HDTB](https://github.com/UniversalDependencies/UD_Hindi-HDTB) | dev corpus only | CC BY-NC-SA 4.0 |
 
 The data is downloaded by the scripts and never committed. Code: MIT.
