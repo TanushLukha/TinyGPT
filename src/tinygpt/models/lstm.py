@@ -129,18 +129,24 @@ class LSTMLM(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
-                 top_k: int | None = None, eot_id: int | None = None,
-                 generator: torch.Generator | None = None) -> torch.Tensor:
-        """Continue (1, T) prompt ids. The prompt is read once; after that each new token costs one
-        LSTM step, because (h, c) already summarises everything before it."""
+    def iter_tokens(self, idx: torch.Tensor, max_new_tokens: int, eot_id: int | None = None,
+                    generator: torch.Generator | None = None, use_cache: bool = True, temperature: float = 1.0,
+                    top_k: int | None = None, **sampling):
+        """Continue the (B, T) prompt, yielding each new (B, 1) token. The prompt is read once; after
+        that each token costs one LSTM step, because (h, c) already summarises everything before it
+        — the LSTM's state is its own "cache" (use_cache is accepted for a common interface)."""
         self.eval()
+        history = idx.cpu()
         logits, state = self.step(idx)
-        out = [idx]
         for _ in range(max_new_tokens):
-            nxt = sample_next(logits[:, -1].cpu(), temperature, top_k, generator).to(idx.device)
-            out.append(nxt)
+            nxt = sample_next(logits[:, -1].cpu(), temperature, top_k, generator, history=history, **sampling)
+            history = torch.cat([history, nxt], dim=1)
+            yield nxt.to(idx.device)
             if eot_id is not None and bool((nxt == eot_id).all()):
-                break
-            logits, state = self.step(nxt, state)
-        return torch.cat(out, dim=1)
+                return
+            logits, state = self.step(nxt.to(idx.device), state)
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, **kwargs) -> torch.Tensor:
+        """Prompt (B, T) -> prompt + continuation. kwargs: see iter_tokens / sampling.sample_next."""
+        return torch.cat([idx, *self.iter_tokens(idx, max_new_tokens, **kwargs)], dim=1)

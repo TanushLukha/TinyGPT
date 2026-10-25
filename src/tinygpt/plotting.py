@@ -5,7 +5,7 @@ SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#89878
 # categorical colours, in a fixed order checked for colour-blind separation
 SLOTS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 # a model keeps its colour in every figure, whichever other models are shown with it
-FIXED = {"lstm": 0, "gpt-llama": 1, "gpt": 2, "gpt-small": 3}
+FIXED = {"lstm": 0, "gpt-llama": 1, "gpt": 2, "gpt-small": 3, "gpt-rope": 6}   # 6: passes next to 1 and 2
 
 
 def run_colors(names) -> dict[str, str]:

@@ -203,8 +203,10 @@ early layer marks each token with the token before it, and a head in a later lay
 place where the current token appeared before" and reads what came next. Only the RoPE model has
 it. The likely reason: with RoPE, "look one token back" is the same rotation at every position, so
 it is learned once; with learned positions, the model must learn it separately for every pair of
-positions, which this budget wasn't enough for. (M3 changed four components at once, so this is the
-best explanation, not a proof — the exercises include swapping in RoPE alone.)
+positions, which this budget wasn't enough for. (M3 changed four components at once, so this was a
+hypothesis. **M4 tested it:** the GPT-2 recipe with only RoPE swapped in reaches 0.737 bits/byte — 91%
+of the gain — and grows the same circuit: a 75% previous-token head in layer 1 and an 18% induction
+head in layer 4. See [M4 §5](M4_inference.md#5-m3s-open-question-is-it-rope).)
 
 ![attention, GPT-2 recipe](results/attention.png)
 ![attention, Llama recipe](results/attention_llama.png)
@@ -335,6 +337,7 @@ already shows exactly how much context is worth to each model.
 15. **Your Llama-style model beat the GPT-2-style one by 6.5% at the same size. What changed, and
     which change matters most?** RoPE, RMSNorm, SwiGLU, no biases. The context curve and the head
     census point to RoPE: relative positions make "look one token back" one pattern instead of 256.
+    (M4's ablation confirmed it: RoPE alone gives 5.9 of the 6.5%.)
 
 ## 7. Try it yourself
 
@@ -342,6 +345,6 @@ already shows exactly how much context is worth to each model.
 - Turn off the causal mask in the manual attention: what happens to the training loss, and why is the
   model useless for generation?
 - Train with 2 heads of 192 or 12 heads of 32 instead of 6 of 64.
-- Swap only one Llama component at a time (RoPE, RMSNorm, SwiGLU) to see which one matters — the
-  head census predicts RoPE.
+- Swap only one Llama component at a time to see which one matters. (M4 did RoPE: 91% of the gain.
+  RMSNorm alone and SwiGLU alone are still open.)
 - Run the copying test with sequences of 20, 50 and 120 tokens.

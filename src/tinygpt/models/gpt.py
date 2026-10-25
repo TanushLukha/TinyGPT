@@ -8,11 +8,16 @@
 Two recipes behind one class (`style`):
   * "gpt2"  — learned absolute positions, LayerNorm, GELU MLP, biases     (GPT-2, 2019)
   * "llama" — rotary positions (RoPE), RMSNorm, SwiGLU MLP, no biases     (Llama, 2023)
-and two implementations of attention with identical maths (`attn`):
+`pos`, `norm` and `mlp` can override single components (e.g. GPT-2 with RoPE, for ablations).
+Two implementations of attention with identical maths (`attn`):
   * "manual" — scores, causal mask, softmax and weighted sum written out (and attention maps can
                be recorded for plotting)
-  * "sdpa"   — torch's fused scaled_dot_product_attention, which never stores the T × T matrix
+  * "sdpa"   — torch's fused scaled_dot_product_attention
 tests/test_gpt.py checks that the two give the same outputs and gradients.
+
+M4 adds a KV-cache for generation: the keys and values of tokens already processed never change,
+so each new token computes only its own and attends to the stored ones (tests/test_kvcache.py
+checks that cached and uncached generation agree).
 """
 from __future__ import annotations
 
@@ -34,10 +39,48 @@ class GPTConfig:
     n_layers: int = 6
     n_heads: int = 6            # head size = d_model / n_heads = 64
     dropout: float = 0.1
-    style: str = "gpt2"         # "gpt2" or "llama"
+    style: str = "gpt2"         # "gpt2" or "llama": sets the four components below
+    pos: str = ""               # "learned" or "rope"           ("" = the style's choice)
+    norm: str = ""              # "layernorm" or "rmsnorm"
+    mlp: str = ""               # "gelu" or "swiglu"
     attn: str = "sdpa"          # "sdpa" (fused) or "manual" (written out)
     tie_weights: bool = True    # output layer = token embedding matrix
     rope_base: float = 10000.0  # RoPE only: wavelength scale of the rotations
+
+    def __post_init__(self):
+        llama = self.style == "llama"
+        self.pos = self.pos or ("rope" if llama else "learned")
+        self.norm = self.norm or ("rmsnorm" if llama else "layernorm")
+        self.mlp = self.mlp or ("swiglu" if llama else "gelu")
+        allowed = {"style": ("gpt2", "llama"), "pos": ("learned", "rope"), "norm": ("layernorm", "rmsnorm"),
+                   "mlp": ("gelu", "swiglu"), "attn": ("sdpa", "manual")}
+        for name, ok in allowed.items():
+            if getattr(self, name) not in ok:
+                raise ValueError(f"{name} must be one of {ok}, got {getattr(self, name)!r}")
+
+
+class KVCache:
+    """Keys and values of every token processed so far, for every layer.
+
+    Buffers are allocated once for the whole context (block_size) and filled in place: appending by
+    concatenation would copy the whole cache at every step.
+    """
+
+    def __init__(self, n_layers: int, batch: int, n_heads: int, max_len: int, head_dim: int, device, dtype):
+        shape = (n_layers, batch, n_heads, max_len, head_dim)
+        self.k = torch.zeros(shape, device=device, dtype=dtype)
+        self.v = torch.zeros(shape, device=device, dtype=dtype)
+        self.max_len, self.pos = max_len, 0          # pos = number of tokens stored
+
+    def store(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Write the new tokens' keys/values (B, H, T, hd) after the stored ones; return all of them."""
+        end = self.pos + k.size(2)
+        self.k[layer, :, :, self.pos:end] = k
+        self.v[layer, :, :, self.pos:end] = v
+        return self.k[layer, :, :, :end], self.v[layer, :, :, :end]
+
+    def nbytes(self) -> int:
+        return self.k.numel() * self.k.element_size() * 2
 
 
 class RMSNorm(nn.Module):
@@ -80,28 +123,39 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=bias)       # mixes the heads' outputs
         self.dropout = cfg.dropout
         self.resid_drop = nn.Dropout(cfg.dropout)
-        self.impl, self.rope = cfg.attn, cfg.style == "llama"
+        self.impl, self.rope = cfg.attn, cfg.pos == "rope"
         self.record = False                    # set True to keep the last attention weights (plots)
         self.last_attn: torch.Tensor | None = None
         T = cfg.block_size
         self.register_buffer("causal", torch.tril(torch.ones(T, T, dtype=torch.bool)), persistent=False)
 
-    def forward(self, x: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cos=None, sin=None, cache: KVCache | None = None,
+                layer: int = 0) -> torch.Tensor:
         B, T, C = x.shape
+        pos = cache.pos if cache is not None else 0     # absolute position of x's first token
         q, k, v = self.qkv(x).split(C, dim=2)
         q, k, v = (t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2) for t in (q, k, v))  # (B, H, T, hd)
         if self.rope:
-            q, k = apply_rope(q, cos[:T], sin[:T]), apply_rope(k, cos[:T], sin[:T])
+            c, s = cos[pos:pos + T], sin[pos:pos + T]
+            q, k = apply_rope(q, c, s), apply_rope(k, c, s)
+        if cache is not None:
+            k, v = cache.store(layer, k, v)              # (B, H, pos + T, hd): old tokens + new ones
+        L = k.size(2)
+        mask = self.causal[pos:pos + T, :L]              # query at position pos+i sees keys 0..pos+i
         p = self.dropout if self.training else 0.0
         if self.impl == "manual" or self.record:
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)   # (B, H, T, T): query t vs key s
-            att = att.masked_fill(~self.causal[:T, :T], float("-inf"))   # no looking at later tokens
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)   # (B, H, T, L): query t vs key s
+            att = att.masked_fill(~mask, float("-inf"))                  # no looking at later tokens
             att = F.softmax(att, dim=-1)                                 # each row sums to 1
             if self.record:
                 self.last_attn = att.detach()
             y = F.dropout(att, p, self.training) @ v                     # weighted sum of values
-        else:
+        elif T == L:                                     # no cache, or the first chunk: plain causal
             y = F.scaled_dot_product_attention(q, k, v, dropout_p=p, is_causal=True)
+        elif T == 1:                                     # one new token: it may see everything stored
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=p)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=p)
         y = y.transpose(1, 2).contiguous().view(B, T, C)                 # concatenate the heads
         return self.resid_drop(self.proj(y))
 
@@ -114,7 +168,7 @@ class MLP(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         d = cfg.d_model
-        self.swiglu = cfg.style == "llama"
+        self.swiglu = cfg.mlp == "swiglu"
         if self.swiglu:
             h = 64 * math.ceil(8 * d / 3 / 64)
             self.gate, self.up = nn.Linear(d, h, bias=False), nn.Linear(d, h, bias=False)
@@ -131,28 +185,27 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        Norm = RMSNorm if cfg.style == "llama" else nn.LayerNorm
+        Norm = RMSNorm if cfg.norm == "rmsnorm" else nn.LayerNorm
         self.ln1, self.attn = Norm(cfg.d_model), CausalSelfAttention(cfg)
         self.ln2, self.mlp = Norm(cfg.d_model), MLP(cfg)
 
-    def forward(self, x: torch.Tensor, cos=None, sin=None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin)     # tokens exchange information
-        return x + self.mlp(self.ln2(x))             # each token processes what it gathered
+    def forward(self, x: torch.Tensor, cos=None, sin=None, cache: KVCache | None = None,
+                layer: int = 0) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), cos, sin, cache, layer)     # tokens exchange information
+        return x + self.mlp(self.ln2(x))                           # each token processes what it gathered
 
 
 class GPT(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        if cfg.style not in ("gpt2", "llama") or cfg.attn not in ("sdpa", "manual"):
-            raise ValueError(f"unknown style/attn: {cfg.style}/{cfg.attn}")
         self.cfg = cfg
         self.wte = nn.Embedding(cfg.vocab_size, cfg.d_model)
-        self.wpe = nn.Embedding(cfg.block_size, cfg.d_model) if cfg.style == "gpt2" else None
+        self.wpe = nn.Embedding(cfg.block_size, cfg.d_model) if cfg.pos == "learned" else None
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
-        self.ln_f = RMSNorm(cfg.d_model) if cfg.style == "llama" else nn.LayerNorm(cfg.d_model)
+        self.ln_f = RMSNorm(cfg.d_model) if cfg.norm == "rmsnorm" else nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
-        if cfg.style == "llama":
+        if cfg.pos == "rope":
             cos, sin = rope_tables(cfg.d_model // cfg.n_heads, cfg.block_size, cfg.rope_base)
             self.register_buffer("rope_cos", cos, persistent=False)
             self.register_buffer("rope_sin", sin, persistent=False)
@@ -178,33 +231,63 @@ class GPT(nn.Module):
             n -= self.wte.weight.numel() + (self.wpe.weight.numel() if self.wpe is not None else 0)
         return n
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, cache: KVCache | None = None):
+        """idx (B, T) -> logits (B, T, V). With a cache, idx are the tokens *after* those already
+        stored, positions continue from cache.pos, and the cache is extended."""
         B, T = idx.shape
-        if T > self.cfg.block_size:
-            raise ValueError(f"sequence of {T} tokens > block_size {self.cfg.block_size}")
+        pos = cache.pos if cache is not None else 0
+        if pos + T > self.cfg.block_size:
+            raise ValueError(f"{pos} + {T} tokens > block_size {self.cfg.block_size}")
         x = self.wte(idx)
         if self.wpe is not None:
-            x = x + self.wpe(torch.arange(T, device=idx.device))
+            x = x + self.wpe(torch.arange(pos, pos + T, device=idx.device))
         x = self.drop(x)
-        for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
+        for i, block in enumerate(self.blocks):
+            x = block(x, self.rope_cos, self.rope_sin, cache, i)
+        if cache is not None:
+            cache.pos += T
         logits = self.head(self.ln_f(x))
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
+    def new_cache(self, batch: int = 1) -> KVCache:
+        p = self.wte.weight
+        return KVCache(self.cfg.n_layers, batch, self.cfg.n_heads, self.cfg.block_size,
+                       self.cfg.d_model // self.cfg.n_heads, p.device, p.dtype)
+
     @torch.no_grad()
-    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0,
-                 top_k: int | None = None, eot_id: int | None = None,
-                 generator: torch.Generator | None = None) -> torch.Tensor:
-        """Continue (1, T) prompt ids. Without a cache, every new token re-reads the whole context
-        (the last block_size tokens) — M4 adds a KV-cache to avoid that."""
+    def iter_tokens(self, idx: torch.Tensor, max_new_tokens: int, eot_id: int | None = None,
+                    generator: torch.Generator | None = None, use_cache: bool = True, temperature: float = 1.0,
+                    top_k: int | None = None, **sampling):
+        """Continue the (B, T) prompt `idx`, yielding each new (B, 1) token as soon as it is chosen.
+
+        Without a cache, every step re-reads the last block_size tokens. With one, the prompt is read
+        once ("prefill") and every step processes only the newest token ("decode"). When the context
+        window is full, the cache restarts from the last half of the text: positions can't go
+        past block_size, so its keys and values must be recomputed at new positions.
+        """
         self.eval()
+        history = idx.cpu()                                # for the repetition penalty
+        cache = self.new_cache(idx.size(0)) if use_cache else None
+        x = idx[:, -self.cfg.block_size:]
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -self.cfg.block_size:])
-            nxt = sample_next(logits[:, -1].cpu(), temperature, top_k, generator).to(idx.device)
-            idx = torch.cat([idx, nxt], dim=1)
+            logits, _ = self(x, cache=cache)
+            nxt = sample_next(logits[:, -1].cpu(), temperature, top_k, generator, history=history, **sampling)
+            history = torch.cat([history, nxt], dim=1)
+            yield nxt.to(idx.device)
             if eot_id is not None and bool((nxt == eot_id).all()):
-                break
-        return idx
+                return
+            if cache is None:
+                x = history[:, -self.cfg.block_size:].to(idx.device)
+            elif cache.pos < self.cfg.block_size:
+                x = nxt.to(idx.device)                     # just the new token
+            else:
+                cache = self.new_cache(idx.size(0))        # window full: re-read the last half
+                x = history[:, -(self.cfg.block_size // 2):].to(idx.device)
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, **kwargs) -> torch.Tensor:
+        """Prompt (B, T) -> prompt + continuation (B, T + n). kwargs: see iter_tokens / sample_next."""
+        return torch.cat([idx, *self.iter_tokens(idx, max_new_tokens, **kwargs)], dim=1)

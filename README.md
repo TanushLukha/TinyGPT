@@ -16,7 +16,7 @@ TinyGPT's tokenizer fixes that (see [M1](docs/M1_tokenizer.md)).
 | ✅ | **M1 — Data & tokenizer** | Hindi Wikipedia + Hinglish corpus; byte-level BPE from scratch with a Devanagari-aware regex; comparison with SentencePiece and GPT tokenizers |
 | ✅ | **M2 — Baselines** | n-gram models (counting) and an LSTM (hand-written + fused); bits-per-byte evaluation; training loop with exact resume |
 | ✅ | **M3 — GPT from scratch** | GPT-2 and Llama recipes (attention by hand + fused kernel, learned positions vs RoPE); trained on the MacBook's GPU against M2's baselines |
-| ⬜ | M4 — Inference | temperature / top-k / top-p sampling, KV-cache with an equivalence test and a speed benchmark |
+| ✅ | **M4 — Inference** | greedy, temperature, top-k, top-p, min-p and repetition penalty measured against real text; KV-cache with equivalence tests and a speed benchmark; streaming; RoPE-only ablation |
 | ⬜ | M5 — Fine-tuning | LoRA from scratch on a Hinglish task |
 | ⬜ | M6 — Ship | FastAPI service, Docker image, Gradio demo on Hugging Face Spaces |
 
@@ -75,6 +75,18 @@ caffeinate -i bash scripts/run_m3.sh           # 12. three GPTs, then tables, cu
 `gpt-llama` (RoPE, RMSNorm, SwiGLU), then writes `docs/results/m3_baselines.md`, `m3_curves.png`,
 `m3_compare.md`, `m3_context.png`, `attention.png` and `attention_llama.png`. Re-running it skips
 finished runs and resumes an interrupted one.
+
+**M4 — inference:**
+
+```bash
+caffeinate -i bash scripts/run_m4.sh           # 13. speed + decoding benchmarks, the RoPE-only GPT, head census
+python scripts/sample.py --stream --top-p 0.9 --top-k 0      # text appears as it is generated
+```
+
+`run_m4.sh` writes `docs/results/m4_generation.md` + `.json` + `m4_latency.png` (time per token
+with and without the KV-cache), `m4_decoding.md` (8 decoding strategies vs real text), trains `gpt-rope`
+(GPT-2 recipe with RoPE only), then `m4_rope_baselines.md`, `m4_rope_curves.png`,
+`m4_rope_compare.md`, `m4_rope_context.png` and `heads.md` + `heads.png` (attention-head census).
 
 An interrupted run continues exactly where it stopped with `python scripts/train.py --resume`.
 Every training setting is a flag (`python scripts/train.py --help`).
@@ -151,6 +163,53 @@ Same data, same 32.8M training tokens, same evaluation as M2 (details in [M3](do
   one head's attention goes to the previous token; another head puts 23% on the copy target).
 - The 4-gram still wins on templated Hinglish; mixing it with the best GPT gives 0.701.
 
+## Results (M4, inference)
+
+Details in [M4](docs/M4_inference.md).
+
+**Was M3's gain RoPE?** The GPT-2 recipe with *only* its positions swapped for RoPE:
+
+| Model | Bits/byte | Hindi | Hinglish | Previous-token head | Induction head |
+|---|---:|---:|---:|---:|---:|
+| GPT-2 recipe | 0.784 | 0.735 | 1.241 | 31% | 3% |
+| **GPT-2 recipe + RoPE** | 0.737 | 0.691 | 1.168 | 75% | 18% |
+| Llama recipe (RoPE, RMSNorm, SwiGLU, no biases) | 0.733 | 0.689 | 1.147 | 72% | 23% |
+
+RoPE alone gives 91% of M3's gain (5.9% of the 6.5%) and grows the same previous-token → induction
+circuit; RMSNorm, SwiGLU and dropping biases add the last 0.6%.
+
+**Decoding** (gpt-llama; 10 validation prompts, 80 new tokens; nll = how predictable the text is to
+the model, repeat-4 = share of 4-token sequences that repeat earlier ones):
+
+| Strategy | nll | distinct-2 | repeat-4 |
+|---|---:|---:|---:|
+| real text (reference) | 2.96 | 0.95 | 0.00 |
+| greedy | 0.99 | 0.25 | 0.73 |
+| temperature 1.0 | 2.85 | 0.94 | 0.01 |
+| top-p 0.9 | 2.14 | 0.88 | 0.03 |
+| min-p 0.1 | 1.59 | 0.83 | 0.05 |
+
+- Greedy text is the most likely and the worst: 73% of its 4-token sequences are repeats.
+- Pure sampling matches real text on all three numbers yet invents words. The model's tail isn't
+  over-weighted — the real next token falls in it about as often as its probability says — the model just
+  can't tell which rare token is right, so cutting the tail (top-p, min-p) trades fidelity for safety.
+
+**Speed** (MacBook Air M2, 240 new tokens, tokens per second):
+
+| Model | CPU | GPU (MPS) | GPU, 16 sequences at once |
+|---|---:|---:|---:|
+| gpt-llama, no cache | 108 | 140 | 335 |
+| gpt-llama, KV-cache | 550 | 274 | 3,415 |
+| LSTM | 3,201 | 882 | 12,406 |
+
+![time per token](docs/results/m4_latency.png)
+
+- The KV-cache keeps the time per token flat instead of growing with the context: 5× faster on the
+  CPU over 240 tokens, with tests proving it generates exactly the same text.
+- For one sequence the CPU beats the GPU (550 vs 274): each step is ~500 tiny operations plus a wait
+  for the GPU's answer, a fixed price that dominates. With 16 sequences the GPU catches up (3,415 vs
+  3,314 on the CPU).
+
 ## Project layout
 
 ```
@@ -160,17 +219,19 @@ src/tinygpt/
   data.py       corpus sources: Hindi Wikipedia, Hinglish datasets, small dev corpus
   dataset.py    memory-mapped token files: random training windows, exact evaluation windows
   metrics.py    bits per byte, overall and per language
+  plotting.py   one look for every chart, a fixed colour per model
   trainer.py    training loop: AdamW, warm-up + cosine, clipping, checkpoints, exact resume
-  sampling.py   temperature and top-k sampling
+  sampling.py   greedy, temperature, top-k, top-p, min-p, repetition penalty; streaming text
   models/
     ngram.py    n-gram counts as sorted int64 codes; add-k and Jelinek-Mercer smoothing
     lstm.py     LSTM language model; ScratchLSTM = the same LSTM written gate by gate
-    gpt.py      GPT: GPT-2 / Llama recipes, attention by hand or fused, RoPE, RMSNorm, SwiGLU
+    gpt.py      GPT: GPT-2 / Llama recipes, attention by hand or fused, RoPE, RMSNorm, SwiGLU, KV-cache
 scripts/        get_data · train_tokenizer · compare_tokenizers · encode_dataset ·
                 ngram_baselines · bench · train · sample · report · compare_models · attention ·
-                run_m3.sh
+                heads · decoding · bench_generate · run_m3.sh · run_m4.sh
 tests/          round trips on random Unicode, fast BPE == naive BPE, hand-written LSTM ==
-                nn.LSTM, n-gram scores == full distributions, stop-and-resume == uninterrupted, ...
+                nn.LSTM, n-gram scores == full distributions, stop-and-resume == uninterrupted,
+                KV-cache == full forward pass, streamed text == decoded text, ...
 docs/           one guide per milestone (concepts, decisions, interview questions)
 ```
 
