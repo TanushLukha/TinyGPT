@@ -1,0 +1,158 @@
+/* TinyGPT in the browser. Indigo ink on a cool page, marigold for the one thing to press and for the
+   tokens the model writes; Hind (Indian Type Foundry) for the interface, Tiro Devanagari Hindi for
+   the model's text, so what the model writes reads like print. */
+:root {
+  --page: #f5f6f8;
+  --sheet: #ffffff;
+  --ink: #1c2340;
+  --muted: #5a6278;
+  --rule: #d9dee8;
+  --marigold: #e8a317;
+  --on-marigold: #1c2340;
+  --tint-a: #fbebc5;
+  --tint-b: #e2e7f5;
+  --slot-1: #fbe3b0; --slot-2: #d9e2f8; --slot-3: #d3efe6; --slot-4: #f6d9e4; --slot-5: #e7e0f7;
+  --danger: #a3341f;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #121628;
+    --sheet: #191e36;
+    --ink: #e6e9f2;
+    --muted: #a0a7bc;
+    --rule: #2b3253;
+    --marigold: #f0b43a;
+    --on-marigold: #121628;
+    --tint-a: #3d3419;
+    --tint-b: #252d4d;
+    --slot-1: #4a3d17; --slot-2: #253154; --slot-3: #1d4038; --slot-4: #4a2534; --slot-5: #362d55;
+    --danger: #f08a73;
+    color-scheme: dark;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 400 1.0625rem/1.6 "Hind", system-ui, sans-serif;
+}
+a { color: inherit; text-decoration-color: var(--marigold); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+a:hover { text-decoration-color: currentColor; }
+:focus-visible { outline: 3px solid var(--marigold); outline-offset: 2px; border-radius: 4px; }
+
+.page { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1rem 3rem; }
+
+/* masthead: the name in the same book face as the model's text */
+.masthead h1 {
+  margin: 0;
+  font: 400 clamp(2.6rem, 8vw, 3.6rem)/1 "Tiro Devanagari Hindi", Georgia, serif;
+  letter-spacing: -0.01em;
+}
+.lede { margin: 0.75rem 0 0; max-width: 38rem; color: var(--muted); font-size: 1.125rem; text-wrap: pretty; }
+.links { margin: 0.6rem 0 0; display: flex; gap: 1.25rem; flex-wrap: wrap; font-weight: 500; }
+
+/* tabs: a quiet underline, no boxes */
+.tabs { display: flex; gap: 1.5rem; margin: 2.25rem 0 1.5rem; border-bottom: 1px solid var(--rule); overflow-x: auto; }
+.tabs button {
+  appearance: none; border: 0; background: none; color: var(--muted); cursor: pointer;
+  font: 500 1rem/1 "Hind", system-ui, sans-serif; padding: 0.75rem 0 0.7rem; white-space: nowrap;
+  border-bottom: 3px solid transparent; margin-bottom: -1px; border-radius: 0;
+}
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--marigold); }
+
+label { display: block; font-weight: 500; }
+textarea, input[type="text"], input[type="number"] {
+  width: 100%; margin-top: 0.35rem; padding: 0.7rem 0.85rem;
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--sheet); color: var(--ink);
+  font: 400 1.125rem/1.5 "Tiro Devanagari Hindi", Georgia, serif; resize: vertical;
+}
+input[type="number"] { font: 400 1rem/1.4 "Hind", system-ui, sans-serif; max-width: 12rem; }
+
+button {
+  appearance: none; cursor: pointer; border-radius: 999px; padding: 0.55rem 1.15rem;
+  font: 500 1rem/1.2 "Hind", system-ui, sans-serif;
+  border: 1px solid var(--rule); background: var(--sheet); color: var(--ink);
+}
+button.primary { background: var(--marigold); border-color: var(--marigold); color: var(--on-marigold); font-weight: 600; }
+button:disabled { cursor: default; opacity: 0.45; }
+.actions { display: flex; gap: 0.6rem; margin-top: 0.8rem; }
+.ask { display: flex; gap: 0.6rem; align-items: stretch; margin-top: 0.35rem; }
+.ask input { margin-top: 0; }
+.ask button { flex: none; }
+
+/* examples: plain text buttons, so the page has one loud button */
+.examples { display: flex; flex-wrap: wrap; gap: 0.35rem 1rem; margin: 0.7rem 0 0; }
+.examples button {
+  border: 0; background: none; padding: 0.1rem 0; border-radius: 0; color: var(--muted);
+  font: 400 1rem/1.4 "Tiro Devanagari Hindi", Georgia, serif;
+  text-decoration: underline; text-decoration-color: var(--rule); text-underline-offset: 4px; text-align: left;
+}
+.examples button:hover { color: var(--ink); text-decoration-color: var(--marigold); }
+
+/* the sheet: where the model writes. The one large surface on the page. */
+.sheet {
+  margin-top: 1.25rem; background: var(--sheet); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 1.25rem 1.4rem 1.4rem; min-height: 14rem;
+}
+.loading { margin: 0 0 0.6rem; color: var(--muted); font-size: 0.95rem; }
+.loading:empty { display: none; }
+.loading progress { display: block; width: 100%; height: 6px; margin-top: 0.5rem; appearance: none; -webkit-appearance: none;
+                    border: 0; border-radius: 3px; overflow: hidden; background: var(--rule); }
+.loading progress::-webkit-progress-bar { background: var(--rule); }
+.loading progress::-webkit-progress-value { background: var(--marigold); }
+.loading progress::-moz-progress-bar { background: var(--marigold); }
+.loading.error { color: var(--danger); }
+.output { white-space: pre-wrap; overflow-wrap: anywhere; font: 400 1.3rem/1.85 "Tiro Devanagari Hindi", Georgia, serif; }
+.output .prompt { color: var(--muted); }
+.output.show-tokens .tok:nth-of-type(odd) { background: var(--tint-a); }
+.output.show-tokens .tok:nth-of-type(even) { background: var(--tint-b); }
+.output.show-tokens .tok { border-radius: 3px; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+
+.under { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-top: 0.6rem; }
+.stats { margin: 0; color: var(--muted); font-size: 0.95rem; }
+.toggle { display: inline-flex; gap: 0.45rem; align-items: center; font-weight: 400; color: var(--muted); font-size: 0.95rem; }
+.toggle input { accent-color: var(--marigold); }
+
+.settings { margin-top: 1.4rem; border-top: 1px solid var(--rule); padding-top: 0.9rem; }
+.settings summary { cursor: pointer; font-weight: 500; }
+.settings summary span { font-weight: 400; color: var(--muted); }
+.knobs { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 1rem 1.75rem; margin-top: 1rem; }
+.knobs label { font-weight: 500; }
+.knobs output { float: right; font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
+.knobs input[type="range"] { width: 100%; accent-color: var(--marigold); margin: 0.4rem 0 0.1rem; }
+.knobs input[type="number"] { display: block; }
+.knobs small { display: block; color: var(--muted); font-weight: 400; font-size: 0.85rem; line-height: 1.35; }
+
+.note { margin: 1.4rem 0 0; color: var(--muted); font-size: 0.95rem; max-width: 40rem; text-wrap: pretty; }
+
+/* parse result: the request with its slots set off and named underneath */
+.annotated { font: 400 1.35rem/1.9 "Tiro Devanagari Hindi", Georgia, serif; display: flex; flex-wrap: wrap; gap: 0.2rem 0.45rem; align-items: flex-start; }
+.annotated .slot { display: inline-flex; flex-direction: column; align-items: center; padding: 0 0.35rem; border-radius: 6px; background: var(--slot-1); }
+.annotated .slot small { font: 500 0.8rem/1.2 "Hind", system-ui, sans-serif; color: var(--ink); opacity: 0.75; padding-bottom: 0.25rem; }
+.intent { margin: 1.1rem 0 0.2rem; font-size: 1.05rem; }
+.intent strong { font-weight: 600; }
+.tree { margin: 0.8rem 0 0; padding: 0.7rem 0.85rem; border-radius: 8px; background: var(--page); color: var(--muted);
+        font: 400 0.9rem/1.5 ui-monospace, "SF Mono", Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.parse-meta { margin: 0.6rem 0 0; color: var(--muted); font-size: 0.9rem; }
+
+.prose h2 { font: 600 1.15rem/1.3 "Hind", system-ui, sans-serif; margin: 1.6rem 0 0.4rem; }
+.prose p { max-width: 40rem; text-wrap: pretty; }
+#facts { border-collapse: collapse; width: 100%; max-width: 40rem; margin: 1rem 0; font-size: 0.98rem; }
+#facts th, #facts td { text-align: left; padding: 0.55rem 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+#facts th { font-weight: 400; color: var(--muted); padding-right: 1rem; }
+#facts td { font-weight: 500; white-space: nowrap; }
+
+.foot { margin-top: 3rem; color: var(--muted); font-size: 0.9rem; }
+
+@media (max-width: 34rem) {
+  .page { padding-top: 1.75rem; }
+  .ask { flex-direction: column; }
+  .sheet { padding: 1rem; }
+  .output { font-size: 1.2rem; }
+  #facts td { white-space: normal; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }

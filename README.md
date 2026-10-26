@@ -9,6 +9,10 @@ splits Hindi words at every vowel sign, so the same sentence costs far more toke
 English — less text fits in the context window and every word costs more compute.
 TinyGPT's tokenizer fixes that (see [M1](docs/M1_tokenizer.md)).
 
+**Try it:** [huggingface.co/spaces/tanushlukha/tinygpt](https://huggingface.co/spaces/tanushlukha/tinygpt) —
+the model runs in your browser, nothing you type leaves it. Weights:
+[huggingface.co/tanushlukha/tinygpt](https://huggingface.co/tanushlukha/tinygpt).
+
 ## Roadmap
 
 | | Milestone | What gets built |
@@ -18,12 +22,12 @@ TinyGPT's tokenizer fixes that (see [M1](docs/M1_tokenizer.md)).
 | ✅ | **M3 — GPT from scratch** | GPT-2 and Llama recipes (attention by hand + fused kernel, learned positions vs RoPE); trained on the MacBook's GPU against M2's baselines |
 | ✅ | **M4 — Inference** | greedy, temperature, top-k, top-p, min-p and repetition penalty measured against real text; KV-cache with equivalence tests and a speed benchmark; streaming; RoPE-only ablation |
 | ✅ | **M5 — Fine-tuning** | LoRA written from scratch vs full fine-tuning vs training from scratch vs few-shot prompting, on Hinglish-TOP semantic parsing; a decontaminated base model |
-| ⬜ | M6 — Ship | FastAPI service, Docker image, Gradio demo on Hugging Face Spaces |
+| ✅ | **M6 — Ship** | safetensors bundles; a FastAPI service with streaming, backpressure and dynamic batching, load-tested; a Docker image; a public demo that runs the model in the browser (a JavaScript port checked against PyTorch) |
 
 ## Quick start
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate     # Python 3.9+
+python3 -m venv .venv && source .venv/bin/activate     # Python 3.10+
 pip install -e ".[data,compare,dev]"
 pytest -q tests/test_bpe.py tests/test_text.py         # M1's tests, a few seconds
 
@@ -100,6 +104,32 @@ pretraining text (`data/clean_dc/`, `data/tokens_dc/`), pretrains `gpt-llama-cle
 fine-tuning experiments (`runs/m5/`, `runs/m5-annotated/`) and writes `docs/results/m5_finetune.md`,
 `m5_rank.png` and `m5_data.png`. It prints the output format and learning rates it chose and the
 name of the best LoRA run.
+
+**M6 — ship:**
+
+```bash
+pip install -e ".[serve,deploy]"               # FastAPI, uvicorn, Gradio, safetensors, Prometheus client
+bash scripts/run_m6.sh                         # 15. export both models, every test, load test (~10 min)
+python -m tinygpt.serve                        # 16. API + demo on http://127.0.0.1:8000 (API docs: /docs)
+docker build -t tinygpt . && docker run --rm -p 8000:8000 tinygpt     # 17. the same, in a container
+python -m http.server 8000                     # 18. the browser demo: http://localhost:8000/web/
+hf auth login && python scripts/deploy_hf.py   # 19. model repo + the browser demo as a static Space
+```
+
+```bash
+curl -s localhost:8000/v1/parse -H 'content-type: application/json' \
+     -d '{"text": "kal subah 7 baje ka alarm laga do"}'
+curl -N localhost:8000/v1/generate/stream -H 'content-type: application/json' \
+     -d '{"prompt": "भारत की राजधानी", "max_new_tokens": 60}'
+```
+
+`run_m6.sh` writes `models/lm/`, `models/parser/` (safetensors bundles, checked against the checkpoints
+and against M5's decoding) and `models/README.md` (the model card), then `docs/results/m6_facts.md`
+(what the language model knows), `m6_load.md`, `m6_load.json`, `m6_parse.png` and — with Node.js
+installed (`brew install node`) — `m6_web.md` (the browser version against PyTorch). Docker and the
+browser demo need `models/` from step 15; `deploy_hf.py` uploads it (`--kind zerogpu` deploys the
+Gradio app instead, for accounts with ZeroGPU). `node web/test/e2e.mjs` checks the demo page in
+Chromium (once: `npm install --no-save playwright && npx playwright install chromium`).
 
 An interrupted run continues exactly where it stopped with `python scripts/train.py --resume`.
 Every training setting is a flag (`python scripts/train.py --help`).
@@ -250,6 +280,29 @@ of the whole parse on 6,513 test requests (details in [M5](docs/M5_lora.md)):
   partly memorised them (0.235 nats/token lower loss on them).
 - Failure mode: names the training data never had are replaced by ones it had (`Delhi` → `Duran`).
 
+## Results (M6, shipping)
+
+Details in [M6](docs/M6_serving.md). The parser behind the API (MacBook Air M2, client and server on the
+same machine; requests per second and median latency):
+
+| Clients | Batching off | Batching on | Mean batch | Median latency, off → on |
+|---:|---:|---:|---:|---:|
+| 1 | 12.4 | 12.3 | 1.0 | 72 → 72 ms |
+| 8 | 13.0 | 17.6 | 6.2 | 611 → 408 ms |
+| 32 | 12.7 | **32.0** | 16.0 | 2,512 → **912** ms |
+
+![parse throughput and latency](docs/results/m6_parse.png)
+
+- Parse requests that wait together share one forward pass: **2.5× the throughput at 32 clients** at
+  a third of the latency, and no change for a single client (the batcher never waits for company).
+- Generation streams ~455 tokens/s, one stream at a time; a full queue answers 503 in 22 ms instead
+  of letting waits grow; a client that disconnects stops its generation.
+- **The browser demo is the same model:** the JavaScript port gives the same token ids on all 5,503
+  validation texts and requests, logits within 3.8 × 10⁻⁶ of PyTorch, the same greedy text (10 of 10)
+  and the same parse trees (200 of 200) — at ~35 ms per token on one CPU thread.
+- **It learned the language, not the facts:** asked for the capitals of 20 states and countries, it
+  ranks the right city first twice — chance level — and the demo says so.
+
 ## Project layout
 
 ```
@@ -264,18 +317,34 @@ src/tinygpt/
   sampling.py   greedy, temperature, top-k, top-p, min-p, repetition penalty; streaming text
   lora.py       LoRA: a low-rank update for any linear layer; merge, save and load adapters
   top.py        Hinglish-TOP: parse trees, the decoupled form, scores, prompts, batched greedy parsing
+  bundle.py     model bundles: safetensors weights + config + tokenizer + checksums
   models/
     ngram.py    n-gram counts as sorted int64 codes; add-k and Jelinek-Mercer smoothing
     lstm.py     LSTM language model; ScratchLSTM = the same LSTM written gate by gate
-    gpt.py      GPT: GPT-2 / Llama recipes, attention by hand or fused, RoPE, RMSNorm, SwiGLU, KV-cache
+    gpt.py      GPT: GPT-2 / Llama recipes, attention by hand or fused, RoPE, RMSNorm, SwiGLU,
+                KV-cache, left-padded batches of different lengths
+  serve/
+    engine.py   the two models as plain objects: streaming generation, batched parsing
+    worker.py   one thread per model: bounded queue (503), cancelling, dynamic batching
+    api.py      FastAPI: JSON + Server-Sent Events endpoints, validation, request ids, metrics
+    ui.py       the service's Gradio demo (also the ZeroGPU Space's page)
+web/            the public demo, a static page: tinygpt.js (tokenizer, model, sampling and parser in
+                JavaScript), worker.js (downloads, checks and runs the models off the page's thread),
+                app.js + index.html + style.css (the page), test/ (the Python tests' bridge to the
+                JavaScript; e2e.mjs: the page in a real browser)
 scripts/        get_data · train_tokenizer · compare_tokenizers · encode_dataset ·
                 ngram_baselines · bench · train · sample · report · compare_models · attention ·
                 heads · decoding · bench_generate · decontaminate · finetune · m5_best · report_m5 ·
-                parse · run_m3.sh · run_m4.sh · run_m5.sh
+                parse · export · probe_facts · load_test · check_web · deploy_hf · run_m3.sh · run_m4.sh ·
+                run_m5.sh · run_m6.sh
+space/          the Gradio app for a ZeroGPU Space: app.py, requirements, settings
+Dockerfile      the service image: CPU-only PyTorch, pinned dependencies (requirements/), non-root
 tests/          round trips on random Unicode, fast BPE == naive BPE, hand-written LSTM ==
                 nn.LSTM, n-gram scores == full distributions, stop-and-resume == uninterrupted,
-                KV-cache == full forward pass, streamed text == decoded text, LoRA starts as the
-                base model and merges exactly, fine-tuning runs end to end, ...
+                KV-cache == full forward pass, padded batch == each row alone, streamed text ==
+                decoded text, LoRA starts as the base model and merges exactly, fine-tuning runs end
+                to end, bundles load exactly, the API's limits, streams, 503s and batches, the
+                JavaScript port == the Python code, what the deploy would upload, ...
 docs/           one guide per milestone (concepts, decisions, interview questions)
 ```
 

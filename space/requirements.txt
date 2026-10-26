@@ -1,0 +1,7 @@
+# Installed by the Space on top of Gradio (README.md: sdk_version). ZeroGPU supports PyTorch up to
+# 2.13 (huggingface.co/docs/hub/spaces-zerogpu), so the Space runs 2.13.0; the Docker image runs 2.14.1.
+torch==2.13.0
+safetensors==0.8.0
+numpy==2.5.4
+regex==2026.9.29
+spaces

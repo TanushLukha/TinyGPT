@@ -2,24 +2,20 @@
 
     python scripts/parse.py --run lora-lr1e-3                         # built-in examples
     python scripts/parse.py --run lora-lr1e-3 "kal subah 7 baje ka alarm laga do"
-    python scripts/parse.py --run lora-lr1e-3 --export checkpoints/parser.pt
 
 A LoRA run is loaded as base + adapter and merged (W + ΔW), so parsing costs exactly what the base
-model costs. --export saves that merged model as an ordinary checkpoint (M6 serves it).
+model costs. M6 serves a run after scripts/export.py has turned it into a bundle.
 """
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import sys
 import time
 from pathlib import Path
 
-import torch
-
 sys.path.insert(0, str(Path(__file__).parent))
-from finetune import cpu_state_dict, load_best  # noqa: E402
+from finetune import load_best  # noqa: E402
 
 from tinygpt.bpe import BPETokenizer  # noqa: E402
 from tinygpt.device import pick_device  # noqa: E402
@@ -37,7 +33,6 @@ def main() -> None:
     ap.add_argument("requests", nargs="*", help="default: a few built-in examples")
     ap.add_argument("--run", required=True, help="a run directory in runs/m5/")
     ap.add_argument("--out-dir", default="runs/m5")
-    ap.add_argument("--export", help="save the merged model as a checkpoint here")
     ap.add_argument("--device", default="auto")
     args = ap.parse_args()
 
@@ -46,13 +41,6 @@ def main() -> None:
     device = pick_device(args.device)
     model = merge_lora(load_best(cfg, run_dir, device)).eval()
     tok = BPETokenizer.load(cfg.tokenizer)
-    if args.export:
-        Path(args.export).parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"model_type": "gpt", "model_config": dataclasses.asdict(model.cfg),
-                    "model": cpu_state_dict(model),
-                    "task": {"name": "hinglish-top", "labels": cfg.labels,
-                             "target": getattr(cfg, "target", "decoupled"), "from_run": args.run}}, args.export)
-        print(f"-> {args.export}")
 
     requests = [normalize(r) for r in (args.requests or EXAMPLES)]
     t0 = time.perf_counter()

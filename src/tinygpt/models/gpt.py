@@ -18,6 +18,10 @@ tests/test_gpt.py checks that the two give the same outputs and gradients.
 M4 adds a KV-cache for generation: the keys and values of tokens already processed never change,
 so each new token computes only its own and attends to the stored ones (tests/test_kvcache.py
 checks that cached and uncached generation agree).
+
+M6 lets one batch hold prompts of different lengths, for serving: shorter prompts are padded on the
+left, padding is masked out of attention, and every row counts positions from its own first real
+token — so each row computes what it would compute alone (tests/test_kvcache.py checks it).
 """
 from __future__ import annotations
 
@@ -64,13 +68,17 @@ class KVCache:
 
     Buffers are allocated once for the whole context (block_size) and filled in place: appending by
     concatenation would copy the whole cache at every step.
+
+    `pad` (B,): how many padding tokens start each row (left padding, M6); None = no padding.
     """
 
-    def __init__(self, n_layers: int, batch: int, n_heads: int, max_len: int, head_dim: int, device, dtype):
+    def __init__(self, n_layers: int, batch: int, n_heads: int, max_len: int, head_dim: int, device, dtype,
+                 pad: torch.Tensor | None = None):
         shape = (n_layers, batch, n_heads, max_len, head_dim)
         self.k = torch.zeros(shape, device=device, dtype=dtype)
         self.v = torch.zeros(shape, device=device, dtype=dtype)
         self.max_len, self.pos = max_len, 0          # pos = number of tokens stored
+        self.pad = None if pad is None else torch.as_tensor(pad, dtype=torch.long, device=device)
 
     def store(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Write the new tokens' keys/values (B, H, T, hd) after the stored ones; return all of them."""
@@ -112,6 +120,23 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
 
 
+def padding_mask(pad: torch.Tensor, pos: int, T: int) -> torch.Tensor:
+    """Attention mask (B, 1, T, pos + T) for left-padded rows, True = may attend: the query at
+    position pos + i sees the keys up to itself that are not padding.
+
+    A padding query sees only itself. With nothing to attend to, its softmax would be 0/0: NaN in
+    the hand-written attention (the fused kernel returns zeros there), and the NaN would spread —
+    real tokens give padding keys weight 0, but 0 × NaN is still NaN.
+    """
+    L = pos + T
+    keys = torch.arange(L, device=pad.device)
+    queries = torch.arange(pos, L, device=pad.device)
+    causal = keys[None, :] <= queries[:, None]                     # (T, L)
+    real = keys[None, :] >= pad[:, None]                           # (B, L): not a padding token
+    itself = keys[None, :] == queries[:, None]                     # (T, L)
+    return (causal & (real[:, None, :] | itself))[:, None]         # (B, 1, T, L)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -130,18 +155,21 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("causal", torch.tril(torch.ones(T, T, dtype=torch.bool)), persistent=False)
 
     def forward(self, x: torch.Tensor, cos=None, sin=None, cache: KVCache | None = None,
-                layer: int = 0) -> torch.Tensor:
+                layer: int = 0, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """cos, sin: RoPE angles of x's positions, (T, hd/2) — or (B, 1, T, hd/2) for padded rows.
+        mask: None = plain causal attention; (B, 1, T, L) for padded rows (see padding_mask)."""
         B, T, C = x.shape
         pos = cache.pos if cache is not None else 0     # absolute position of x's first token
         q, k, v = self.qkv(x).split(C, dim=2)
         q, k, v = (t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2) for t in (q, k, v))  # (B, H, T, hd)
         if self.rope:
-            c, s = cos[pos:pos + T], sin[pos:pos + T]
-            q, k = apply_rope(q, c, s), apply_rope(k, c, s)
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         if cache is not None:
             k, v = cache.store(layer, k, v)              # (B, H, pos + T, hd): old tokens + new ones
         L = k.size(2)
-        mask = self.causal[pos:pos + T, :L]              # query at position pos+i sees keys 0..pos+i
+        padded = mask is not None
+        if not padded:
+            mask = self.causal[pos:pos + T, :L]          # query at position pos+i sees keys 0..pos+i
         p = self.dropout if self.training else 0.0
         if self.impl == "manual" or self.record:
             att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)   # (B, H, T, L): query t vs key s
@@ -150,6 +178,8 @@ class CausalSelfAttention(nn.Module):
             if self.record:
                 self.last_attn = att.detach()
             y = F.dropout(att, p, self.training) @ v                     # weighted sum of values
+        elif padded:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=p)
         elif T == L:                                     # no cache, or the first chunk: plain causal
             y = F.scaled_dot_product_attention(q, k, v, dropout_p=p, is_causal=True)
         elif T == 1:                                     # one new token: it may see everything stored
@@ -190,8 +220,8 @@ class Block(nn.Module):
         self.ln2, self.mlp = Norm(cfg.d_model), MLP(cfg)
 
     def forward(self, x: torch.Tensor, cos=None, sin=None, cache: KVCache | None = None,
-                layer: int = 0) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), cos, sin, cache, layer)     # tokens exchange information
+                layer: int = 0, mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), cos, sin, cache, layer, mask)   # tokens exchange information
         return x + self.mlp(self.ln2(x))                           # each token processes what it gathered
 
 
@@ -233,17 +263,29 @@ class GPT(nn.Module):
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None, cache: KVCache | None = None):
         """idx (B, T) -> logits (B, T, V). With a cache, idx are the tokens *after* those already
-        stored, positions continue from cache.pos, and the cache is extended."""
+        stored, positions continue from cache.pos, and the cache is extended. With a padded cache
+        (cache.pad), row b counts positions from its first real token and its padding is masked."""
         B, T = idx.shape
         pos = cache.pos if cache is not None else 0
         if pos + T > self.cfg.block_size:
             raise ValueError(f"{pos} + {T} tokens > block_size {self.cfg.block_size}")
+        pad = cache.pad if cache is not None else None
+        positions = torch.arange(pos, pos + T, device=idx.device)          # (T,)
+        mask = None
+        if pad is not None:
+            mask = padding_mask(pad, pos, T)
+            positions = (positions - pad[:, None]).clamp(min=0)              # (B, T): as if unpadded
         x = self.wte(idx)
         if self.wpe is not None:
-            x = x + self.wpe(torch.arange(pos, pos + T, device=idx.device))
+            x = x + self.wpe(positions)
         x = self.drop(x)
+        cos = sin = None
+        if self.rope_cos is not None:
+            cos, sin = self.rope_cos[positions], self.rope_sin[positions]    # (T, hd/2) or (B, T, hd/2)
+            if pad is not None:
+                cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)                # (B, 1, T, hd/2): every head
         for i, block in enumerate(self.blocks):
-            x = block(x, self.rope_cos, self.rope_sin, cache, i)
+            x = block(x, cos, sin, cache, i, mask)
         if cache is not None:
             cache.pos += T
         logits = self.head(self.ln_f(x))
@@ -252,25 +294,35 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
         return logits, loss
 
-    def new_cache(self, batch: int = 1) -> KVCache:
+    def new_cache(self, batch: int = 1, pad: torch.Tensor | None = None) -> KVCache:
         p = self.wte.weight
         return KVCache(self.cfg.n_layers, batch, self.cfg.n_heads, self.cfg.block_size,
-                       self.cfg.d_model // self.cfg.n_heads, p.device, p.dtype)
+                       self.cfg.d_model // self.cfg.n_heads, p.device, p.dtype, pad=pad)
 
     @torch.no_grad()
     def iter_tokens(self, idx: torch.Tensor, max_new_tokens: int, eot_id: int | None = None,
                     generator: torch.Generator | None = None, use_cache: bool = True, temperature: float = 1.0,
-                    top_k: int | None = None, **sampling):
+                    top_k: int | None = None, pad: torch.Tensor | None = None, **sampling):
         """Continue the (B, T) prompt `idx`, yielding each new (B, 1) token as soon as it is chosen.
 
         Without a cache, every step re-reads the last block_size tokens. With one, the prompt is read
         once ("prefill") and every step processes only the newest token ("decode"). When the context
         window is full, the cache restarts from the last half of the text: positions can't go
         past block_size, so its keys and values must be recomputed at new positions.
+
+        `pad` (B,): row b of idx starts with pad[b] padding tokens — a batch of prompts of different
+        lengths, padded on the left (M6). It needs the cache, and the text must fit in one window
+        (a restart would have to re-pad every row).
         """
         self.eval()
+        if pad is not None:
+            if not use_cache:
+                raise ValueError("a padded batch needs the KV-cache")
+            if idx.size(1) + max_new_tokens - 1 > self.cfg.block_size:
+                raise ValueError(f"a padded batch must fit in one window: {idx.size(1)} prompt tokens + "
+                                 f"{max_new_tokens} new > block_size {self.cfg.block_size} + 1")
         history = idx.cpu()                                # for the repetition penalty
-        cache = self.new_cache(idx.size(0)) if use_cache else None
+        cache = self.new_cache(idx.size(0), pad=pad) if use_cache else None
         x = idx[:, -self.cfg.block_size:]
         for _ in range(max_new_tokens):
             logits, _ = self(x, cache=cache)

@@ -12,6 +12,12 @@ checkpoints/
 runs/
 *.bin
 
+# exported model bundles: published on the Hugging Face Hub, not in git (scripts/export.py)
+models/
+
+# Node.js packages for web/test/e2e.mjs (npm install --no-save playwright)
+node_modules/
+
 # keep the trained tokenizers, drop throwaway ones
 tokenizer/*-4k.*
 tokenizer/spm_*

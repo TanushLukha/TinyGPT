@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TinyGPT — Hindi and Hinglish, in your browser</title>
+  <meta name="description" content="A 13.8M-parameter GPT for Hindi and Hinglish, written from scratch, running entirely in your browser.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Hind:wght@400;500;600&family=Tiro+Devanagari+Hindi&display=swap">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+<main class="page">
+  <header class="masthead">
+    <h1>TinyGPT</h1>
+    <p class="lede">A 13.8-million-parameter language model for Hindi and Hinglish, written from scratch.
+      It runs right here, on your device: what you type never leaves this page.</p>
+    <p class="links"><a href="https://github.com/TanushLukha/TinyGPT" target="_blank" rel="noopener">Code and write-ups</a>
+      <a id="model-link" href="https://huggingface.co/tanushlukha/tinygpt" target="_blank" rel="noopener">Model weights</a></p>
+  </header>
+
+  <div class="tabs" role="tablist" aria-label="What to try">
+    <button role="tab" id="tab-write" aria-controls="panel-write" aria-selected="true">Write</button>
+    <button role="tab" id="tab-parse" aria-controls="panel-parse" aria-selected="false" tabindex="-1">Understand a request</button>
+    <button role="tab" id="tab-about" aria-controls="panel-about" aria-selected="false" tabindex="-1">About</button>
+  </div>
+
+  <section id="panel-write" class="panel" role="tabpanel" aria-labelledby="tab-write">
+    <label for="prompt">Start of the text</label>
+    <textarea id="prompt" rows="2" maxlength="2000" spellcheck="false">हिन्दी भाषा</textarea>
+    <div class="actions">
+      <button id="go" class="primary" disabled>Continue the text</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+    <div class="examples" id="prompt-examples" aria-label="Examples"></div>
+
+    <div class="sheet">
+      <p class="loading" id="lm-status" role="status">Starting…</p>
+      <div class="output show-tokens" id="output" aria-live="polite"></div>
+    </div>
+    <div class="under">
+      <p class="stats" id="stats"></p>
+      <label class="toggle"><input type="checkbox" id="show-tokens" checked> Show tokens</label>
+    </div>
+
+    <details class="settings">
+      <summary>Decoding settings: <span id="settings-summary"></span></summary>
+      <div class="knobs">
+        <label>Temperature <output for="temperature"></output>
+          <input type="range" id="temperature" min="0" max="1.5" step="0.05" value="0.8">
+          <small>0 always takes the likeliest token, and soon repeats itself</small></label>
+        <label>Top-k <output for="top-k"></output>
+          <input type="range" id="top-k" min="0" max="200" step="1" value="50">
+          <small>keep the k likeliest tokens; 0 turns it off</small></label>
+        <label>Top-p <output for="top-p"></output>
+          <input type="range" id="top-p" min="0.05" max="1" step="0.05" value="1">
+          <small>keep the likeliest tokens that add up to p; 1 turns it off</small></label>
+        <label>Min-p <output for="min-p"></output>
+          <input type="range" id="min-p" min="0" max="0.5" step="0.01" value="0">
+          <small>drop tokens less likely than min-p × the best one; 0 turns it off</small></label>
+        <label>Repetition penalty <output for="repetition"></output>
+          <input type="range" id="repetition" min="1" max="2" step="0.05" value="1">
+          <small>push down tokens already written; 1 turns it off</small></label>
+        <label>New tokens <output for="max-new"></output>
+          <input type="range" id="max-new" min="8" max="256" step="8" value="120"></label>
+        <label>Seed
+          <input type="number" id="seed" min="0" max="2147483647" placeholder="random">
+          <small>the same seed and settings write the same text</small></label>
+      </div>
+    </details>
+
+    <p class="note">TinyGPT writes the way its training text reads — Hindi Wikipedia and Hinglish — but it
+      learned the language, not the facts. Asked for the capitals of 20 states and countries, it puts the
+      right city first only twice, no better than chance. Treat names, dates and places as invented.</p>
+  </section>
+
+  <section id="panel-parse" class="panel" role="tabpanel" aria-labelledby="tab-parse" hidden>
+    <label for="request">A request to a voice assistant, in Hinglish</label>
+    <div class="ask">
+      <input id="request" type="text" maxlength="300" spellcheck="false" value="kal subah 7 baje ka alarm laga do">
+      <button id="parse" class="primary" disabled>Find intent and details</button>
+    </div>
+    <div class="examples" id="request-examples" aria-label="Examples"></div>
+
+    <div class="sheet">
+      <p class="loading" id="parser-status" role="status"></p>
+      <div id="parsed" aria-live="polite"></div>
+    </div>
+    <p class="note" id="parser-note">A copy of the model fine-tuned on Hinglish-TOP finds what the request asks for
+      (the intent) and the details an assistant would need (the slots).</p>
+  </section>
+
+  <section id="panel-about" class="panel prose" role="tabpanel" aria-labelledby="tab-about" hidden>
+    <p>TinyGPT is a decoder-only Transformer — the Llama recipe: rotary positions, RMSNorm, SwiGLU —
+      trained from scratch on 18 million tokens of Hindi Wikipedia and Hinglish, on a laptop. Everything is
+      written by hand: the tokenizer, the model, training, decoding, fine-tuning with LoRA, and the service.</p>
+    <h2>How this page works</h2>
+    <p>Your browser downloads the model files once (55 MB each, kept for your next visit) and does all the
+      work itself: the tokenizer, the forward pass through every layer, the sampling. That code is a
+      JavaScript copy of the Python version, checked against PyTorch: the same token ids, logits within a few
+      millionths, and the same parses.</p>
+    <table id="facts">
+      <tbody>
+        <tr><th scope="row">Parameters</th><td data-fact="params">13.8 million</td></tr>
+        <tr><th scope="row">Bits per byte on unseen text (lower is better)</th><td data-fact="bpb">–</td></tr>
+        <tr><th scope="row">Capitals of 20 places: right city ranked first</th><td>2 of 20 (chance: 1)</td></tr>
+        <tr><th scope="row">Parser: whole parse right on unseen requests</th><td data-fact="em">–</td></tr>
+        <tr><th scope="row">Parser: intent right</th><td data-fact="intent">–</td></tr>
+      </tbody>
+    </table>
+    <p>The parser is a twin of this model — pretrained the same way, minus Hinglish-TOP's validation and
+      test requests — fine-tuned on 2,993 Hinglish-TOP requests. It writes the request back with brackets around the details.
+      <a href="https://github.com/TanushLukha/TinyGPT" target="_blank" rel="noopener">The code and a write-up of every step</a> are on GitHub.</p>
+  </section>
+
+  <footer class="foot">Built by Tanush Lukha.</footer>
+</main>
+</body>
+</html>

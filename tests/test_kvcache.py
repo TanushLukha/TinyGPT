@@ -55,6 +55,57 @@ def test_batched_generation_equals_one_by_one():
         assert torch.equal(together[i:i + 1], m.generate(prompts[i:i + 1], 8, temperature=0))
 
 
+def left_pad(rows: list[list[int]], pad_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+    T = max(map(len, rows))
+    return (torch.tensor([[pad_id] * (T - len(r)) + r for r in rows]),
+            torch.tensor([T - len(r) for r in rows]))
+
+
+@pytest.mark.parametrize("style,attn", CASES)
+def test_padded_batch_computes_what_each_row_computes_alone(style, attn):
+    """Prompts of different lengths in one left-padded batch: every row's logits — after the prompt
+    and after each new token — equal that row's logits without padding."""
+    m = tiny(style, attn)
+    torch.manual_seed(1)
+    rows = [torch.randint(0, 59, (n,)).tolist() for n in (3, 7, 5)]
+    x, pad = left_pad(rows, pad_id=59)
+    cache = m.new_cache(batch=3, pad=pad)
+    batched = [m(x, cache=cache)[0][:, -1]]
+    nxt = torch.randint(0, 59, (3, 4))
+    for t in range(4):
+        batched.append(m(nxt[:, t:t + 1], cache=cache)[0][:, -1])
+    for i, r in enumerate(rows):
+        alone_cache = m.new_cache()
+        alone = [m(torch.tensor([r]), cache=alone_cache)[0][:, -1]]
+        for t in range(4):
+            alone.append(m(nxt[i:i + 1, t:t + 1], cache=alone_cache)[0][:, -1])
+        for b, a in zip(batched, alone):
+            assert torch.isfinite(b[i]).all()
+            torch.testing.assert_close(b[i:i + 1], a, atol=1e-5, rtol=1e-4)
+
+
+@pytest.mark.parametrize("style", ["gpt2", "llama"])
+def test_padded_greedy_generation_equals_one_by_one(style):
+    m = tiny(style)
+    torch.manual_seed(2)
+    rows = [torch.randint(0, 59, (n,)).tolist() for n in (2, 6, 4, 6)]
+    x, pad = left_pad(rows, pad_id=59)
+    together = torch.cat(list(m.iter_tokens(x, 8, temperature=0, pad=pad)), dim=1)
+    for i, r in enumerate(rows):
+        alone = torch.cat(list(m.iter_tokens(torch.tensor([r]), 8, temperature=0)), dim=1)
+        assert torch.equal(together[i:i + 1], alone)
+
+
+def test_padded_batch_limits():
+    m = tiny("llama")                                    # block_size 16
+    x, pad = left_pad([[1, 2, 3], [4]], pad_id=59)
+    assert len(list(m.iter_tokens(x, 14, temperature=0, pad=pad))) == 14     # 3 + 14 - 1 = 16 fits
+    with pytest.raises(ValueError):
+        next(m.iter_tokens(x, 15, temperature=0, pad=pad))                   # would need a restart
+    with pytest.raises(ValueError):
+        next(m.iter_tokens(x, 4, temperature=0, pad=pad, use_cache=False))
+
+
 def test_cache_too_long_is_an_error():
     m = tiny()
     cache = m.new_cache()

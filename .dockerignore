@@ -1,0 +1,10 @@
+# Allow-list: send Docker only what the image needs. (data/, checkpoints/ and runs/ are gigabytes;
+# sending them would make every build slow, and nothing in them belongs in the image.)
+*
+!pyproject.toml
+!README.md
+!requirements/serve.txt
+!src/
+!models/
+**/__pycache__
+**/*.pyc
